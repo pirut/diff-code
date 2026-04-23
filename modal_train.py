@@ -10,6 +10,7 @@ import torch
 
 from code_diffusion.config import load_config
 from code_diffusion.data import CodeDiffusionDataset
+from code_diffusion.evaluation import load_cases_file
 from code_diffusion.models import load_diffusion_model
 from code_diffusion.training import run_preflight_batch, train
 
@@ -106,6 +107,43 @@ def _prepare_remote_config(
     return local_config, remote_config, local_data_dir, str(remote_data_dir)
 
 
+def _find_latest_resume_checkpoint(output_dir: Path) -> Path | None:
+    latest_step = -1
+    latest_dir: Path | None = None
+    if not output_dir.exists():
+        return None
+    for candidate in output_dir.glob("step-*"):
+        if not candidate.is_dir():
+            continue
+        trainer_state_path = candidate / "trainer_state.pt"
+        adapter_config_path = candidate / "adapter_config.json"
+        if not trainer_state_path.exists() or not adapter_config_path.exists():
+            continue
+        try:
+            step = int(candidate.name.split("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if step > latest_step:
+            latest_step = step
+            latest_dir = candidate
+    return latest_dir
+
+
+def _apply_resume_config(config: dict) -> tuple[dict, Path | None]:
+    if not bool(config.get("resume_from_checkpoint", True)):
+        return dict(config), None
+
+    output_dir = Path(config["output_dir"])
+    checkpoint_dir = _find_latest_resume_checkpoint(output_dir)
+    if checkpoint_dir is None:
+        return dict(config), None
+
+    resumed = dict(config)
+    resumed["model_name"] = str(checkpoint_dir)
+    resumed["resume_checkpoint_dir"] = str(checkpoint_dir)
+    return resumed, checkpoint_dir
+
+
 def _build_dataset(
     *,
     tokenizer,
@@ -127,21 +165,39 @@ def _build_dataset(
 
 
 @app.function(**function_kwargs)
-def train_remote(config: dict) -> dict[str, float | str]:
+def train_remote(
+    config: dict,
+    benchmark_cases: list[dict[str, object]] | None = None,
+    benchmark_options: dict[str, object] | None = None,
+) -> dict[str, float | str]:
     _set_seed(int(config.get("seed", 7)))
 
-    model, tokenizer = load_diffusion_model(config)
-    dataset = _build_dataset(tokenizer=tokenizer, config=config)
-    dataset.export_summary(config["output_dir"])
-    metrics = train(model=model, tokenizer=tokenizer, dataset=dataset, config=config)
+    runtime_config, resume_checkpoint = _apply_resume_config(config)
+    if resume_checkpoint is not None:
+        print(f"resuming_from_checkpoint={resume_checkpoint}")
+
+    model, tokenizer = load_diffusion_model(runtime_config)
+    dataset = _build_dataset(tokenizer=tokenizer, config=runtime_config)
+    dataset.export_summary(runtime_config["output_dir"])
+    metrics = train(
+        model=model,
+        tokenizer=tokenizer,
+        dataset=dataset,
+        config=runtime_config,
+        benchmark_cases=benchmark_cases,
+        benchmark_options=benchmark_options,
+        checkpoint_callback=lambda _checkpoint_dir, _benchmark_result: output_volume.commit(),
+    )
 
     output_volume.commit()
     cache_volume.commit()
 
     return {
-        "run_dir": str(Path(config["output_dir"])),
+        "run_dir": str(Path(runtime_config["output_dir"])),
         "final_loss": float(metrics["final_loss"]),
         "final_masked_accuracy": float(metrics["final_masked_accuracy"]),
+        "best_benchmark_score": float(metrics.get("best_benchmark_score", 0.0)),
+        "best_checkpoint": str(metrics.get("best_checkpoint", "")),
     }
 
 
@@ -185,14 +241,33 @@ def main(
     skip_upload: bool = False,
     preflight_max_files: int = 4,
     preflight_max_samples: int = 4,
+    benchmark_cases: str = "",
+    benchmark_steps: int = 0,
+    benchmark_temperature: float = 0.0,
+    benchmark_top_k: int = 0,
+    benchmark_top_p: float = 1.0,
+    benchmark_show_samples: int = 1,
+    benchmark_output_subdir: str = "benchmarks",
 ):
     override_list = _parse_overrides(overrides)
     effective_run_name = run_name or _timestamped_run_name()
-    _, remote_config, local_data_dir, remote_data_dir = _prepare_remote_config(
+    local_config, remote_config, local_data_dir, remote_data_dir = _prepare_remote_config(
         config_path=config,
         overrides=override_list,
         run_name=effective_run_name,
     )
+    loaded_benchmark_cases = load_cases_file(benchmark_cases) if benchmark_cases else None
+    benchmark_options = None
+    if loaded_benchmark_cases:
+        benchmark_options = {
+            "cases_label": str(Path(benchmark_cases).resolve()),
+            "steps": benchmark_steps or remote_config["diffusion_steps"],
+            "temperature": benchmark_temperature,
+            "top_k": benchmark_top_k,
+            "top_p": benchmark_top_p,
+            "show_samples": benchmark_show_samples,
+            "output_subdir": benchmark_output_subdir,
+        }
 
     if not skip_upload:
         # batch_upload writes into the volume's own filesystem root, not the mount path.
@@ -207,8 +282,37 @@ def main(
             dataset_max_samples=preflight_max_samples,
         )
     elif mode == "train":
-        result = train_remote.remote(remote_config)
+        result = train_remote.remote(
+            remote_config,
+            benchmark_cases=loaded_benchmark_cases,
+            benchmark_options=benchmark_options,
+        )
+        if loaded_benchmark_cases:
+            _download_remote_subdir(
+                volume=output_volume,
+                remote_subdir=f"{effective_run_name}/{benchmark_output_subdir}",
+                local_destination=Path(local_config["output_dir"]) / effective_run_name / benchmark_output_subdir,
+            )
     else:
         raise ValueError("mode must be 'preflight' or 'train'")
 
     print(result)
+
+
+def _download_remote_subdir(*, volume: modal.Volume, remote_subdir: str, local_destination: Path) -> None:
+    try:
+        entries = volume.listdir(remote_subdir, recursive=True)
+    except FileNotFoundError:
+        return
+
+    files = [entry for entry in entries if getattr(entry.type, "name", "") != "DIRECTORY"]
+    if not files:
+        return
+
+    local_destination.mkdir(parents=True, exist_ok=True)
+    for entry in files:
+        relative = Path(entry.path).relative_to(remote_subdir)
+        destination = local_destination / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as handle:
+            volume.read_file_into_fileobj(entry.path, handle)

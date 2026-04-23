@@ -46,6 +46,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "refinement": 0.15,
         "doc_test_based": 0.10,
     },
+    "benchmark_controller_enabled": True,
+    "benchmark_controller_score_weights": {
+        "exact_match": 0.7,
+        "similarity": 0.3,
+    },
+    "benchmark_controller_best_dirname": "best",
+    "benchmark_controller_improvement_threshold": 1e-4,
+    "benchmark_controller_plateau_patience": 2,
+    "benchmark_controller_lr_decay_factor": 0.5,
+    "benchmark_controller_min_learning_rate": 1e-5,
+    "benchmark_controller_reweight_task_mix": True,
+    "benchmark_controller_task_mix_strength": 1.0,
+    "benchmark_controller_task_mix_momentum": 0.5,
+    "benchmark_controller_min_task_weight": 0.05,
     "mask_strategy_weights": {
         "random": 0.30,
         "span": 0.25,
@@ -78,6 +92,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_line_length": 400,
     "max_code_lines": 2_000,
     "dataset_preview_examples": 5,
+    "prepared_examples_filename": "prepared_examples.jsonl",
+    "prepare_output_dir": "./outputs/prepared_corpus/public_mix_v1",
+    "prepare_include_local_data": True,
+    "prepare_include_codesearchnet": True,
+    "prepare_include_commitpackft": True,
+    "prepare_include_swe_rebench": True,
+    "prepare_languages": ["python", "javascript", "typescript", "go", "rust"],
+    "prepare_codesearchnet_examples_per_language": 200,
+    "prepare_commitpack_examples_per_language": 200,
+    "prepare_swe_rebench_examples_per_language": 75,
+    "prepare_max_local_files": 200,
+    "prepare_context_lines": 24,
+    "prepare_max_example_chars": 12000,
+    "prepare_include_commit_context": True,
+    "prepare_include_issue_context": True,
+    "prepare_include_repo_context": True,
+    "prepare_context_max_lines": 8,
     "synthetic_generation_enabled": False,
     "synthetic_provider": None,
     "synthetic_model": None,
@@ -107,6 +138,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "trust_remote_code": False,
     "log_every": 5,
     "save_every": 25,
+    "resume_from_checkpoint": True,
     "dtype": "bfloat16",
 }
 
@@ -122,17 +154,31 @@ INT_KEYS = {
     "seed",
     "log_every",
     "save_every",
+    "benchmark_controller_plateau_patience",
     "mask_span_min_tokens",
     "mask_span_max_tokens",
     "max_file_size_bytes",
     "max_line_length",
     "max_code_lines",
     "dataset_preview_examples",
+    "prepare_codesearchnet_examples_per_language",
+    "prepare_commitpack_examples_per_language",
+    "prepare_swe_rebench_examples_per_language",
+    "prepare_max_local_files",
+    "prepare_context_lines",
+    "prepare_max_example_chars",
+    "prepare_context_max_lines",
     "synthetic_timeout_seconds",
 }
 
 FLOAT_KEYS = {
     "learning_rate",
+    "benchmark_controller_improvement_threshold",
+    "benchmark_controller_lr_decay_factor",
+    "benchmark_controller_min_learning_rate",
+    "benchmark_controller_task_mix_strength",
+    "benchmark_controller_task_mix_momentum",
+    "benchmark_controller_min_task_weight",
     "weight_decay",
     "grad_clip",
     "mask_ratio_min",
@@ -144,6 +190,28 @@ FLOAT_KEYS = {
     "lora_dropout",
     "random_mask_ratio_min",
     "random_mask_ratio_max",
+}
+
+BOOL_KEYS = {
+    "gradient_checkpointing",
+    "qlora_use_double_quant",
+    "deduplicate_dataset",
+    "validate_python",
+    "filter_generated_code",
+    "filter_minified_code",
+    "filter_boilerplate",
+    "prepare_include_local_data",
+    "prepare_include_codesearchnet",
+    "prepare_include_commitpackft",
+    "prepare_include_swe_rebench",
+    "prepare_include_commit_context",
+    "prepare_include_issue_context",
+    "prepare_include_repo_context",
+    "synthetic_generation_enabled",
+    "trust_remote_code",
+    "resume_from_checkpoint",
+    "benchmark_controller_enabled",
+    "benchmark_controller_reweight_task_mix",
 }
 
 
@@ -194,6 +262,7 @@ def load_config(config_path: str | Path, overrides: list[str] | None = None) -> 
     base_dir = config_path.parent
     config["data_dir"] = _coerce_path(base_dir, config.get("data_dir"))
     config["output_dir"] = _coerce_path(base_dir, config.get("output_dir"))
+    config["prepare_output_dir"] = _coerce_path(base_dir, config.get("prepare_output_dir"))
     config["synthetic_cache_dir"] = _coerce_path(base_dir, config.get("synthetic_cache_dir"))
     config["config_path"] = str(config_path)
 
@@ -203,6 +272,9 @@ def load_config(config_path: str | Path, overrides: list[str] | None = None) -> 
     for key in FLOAT_KEYS:
         if config.get(key) is not None:
             config[key] = float(config[key])
+    for key in BOOL_KEYS:
+        if config.get(key) is not None:
+            config[key] = bool(config[key])
 
     if config["mask_ratio_min"] > config["mask_ratio_max"]:
         raise ValueError("mask_ratio_min must be <= mask_ratio_max")

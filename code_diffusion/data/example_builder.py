@@ -146,6 +146,60 @@ def build_training_example(
     }
 
 
+def build_prepared_training_example(
+    *,
+    tokenizer,
+    task_type: str,
+    target_code: str,
+    corrupted_code: str,
+    metadata: dict[str, object],
+    mask_metadata: dict[str, object],
+    seq_length: int,
+    pad_token_id: int,
+    mask_token_id: int,
+) -> dict[str, object]:
+    target_ids = tokenizer(target_code, add_special_tokens=False, truncation=False)["input_ids"]
+    corrupted_ids = tokenizer(corrupted_code, add_special_tokens=False, truncation=False)["input_ids"]
+    if not target_ids:
+        raise ValueError("Prepared example target_code tokenized to zero tokens.")
+
+    clean_tensor = torch.tensor(target_ids, dtype=torch.long)
+    aligned_ids, mask_positions, alignment_metadata = _align_corrupted_tokens(
+        clean_ids=clean_tensor,
+        corrupted_ids=corrupted_ids,
+        mask_token_id=mask_token_id,
+    )
+    if not mask_positions.any():
+        corrupted_ids_tensor, mask_positions = corrupt_code(
+            clean_tensor,
+            mask_token_id=mask_token_id,
+            mask_ratio=0.15,
+            mode="span",
+        )
+        aligned_ids = corrupted_ids_tensor
+        alignment_metadata = {"masked_token_count": int(mask_positions.sum().item()), "dropped_insertions": 0}
+
+    clean_tensor, aligned_ids, mask_positions = _crop_aligned_tensors(
+        clean_ids=clean_tensor,
+        aligned_ids=aligned_ids,
+        mask_positions=mask_positions,
+        seq_length=seq_length,
+    )
+    attention_mask = torch.ones(clean_tensor.shape[0], dtype=torch.long)
+
+    return {
+        "input_ids": _pad_tensor(aligned_ids, seq_length, pad_token_id),
+        "labels": _pad_tensor(clean_tensor, seq_length, pad_token_id),
+        "mask": _pad_bool_tensor(mask_positions, seq_length),
+        "attention_mask": _pad_tensor(attention_mask, seq_length, 0),
+        "task_type": task_type,
+        "corrupted_code": corrupted_code,
+        "target_code": target_code,
+        "mask_metadata": {**mask_metadata, **alignment_metadata},
+        "metadata": metadata,
+    }
+
+
 def _build_masked_reconstruction_example(
     *,
     clean_ids: torch.LongTensor,
@@ -489,6 +543,39 @@ def _pad_bool_tensor(values: torch.BoolTensor, target_length: int) -> torch.Bool
     padded = torch.zeros(target_length, dtype=torch.bool)
     padded[: values.shape[0]] = values
     return padded
+
+
+def _crop_aligned_tensors(
+    *,
+    clean_ids: torch.LongTensor,
+    aligned_ids: torch.LongTensor,
+    mask_positions: torch.BoolTensor,
+    seq_length: int,
+) -> tuple[torch.LongTensor, torch.LongTensor, torch.BoolTensor]:
+    if clean_ids.shape[0] <= seq_length:
+        return clean_ids, aligned_ids, mask_positions
+
+    mask_indices = torch.nonzero(mask_positions, as_tuple=False).flatten()
+    if mask_indices.numel() == 0:
+        return (
+            clean_ids[:seq_length].clone(),
+            aligned_ids[:seq_length].clone(),
+            mask_positions[:seq_length].clone(),
+        )
+
+    first = int(mask_indices[0].item())
+    last = int(mask_indices[-1].item())
+    masked_span = last - first + 1
+    available_context = max(0, seq_length - masked_span)
+    left_context = available_context // 2
+    start = max(0, first - left_context)
+    end = min(clean_ids.shape[0], start + seq_length)
+    start = max(0, end - seq_length)
+    return (
+        clean_ids[start:end].clone(),
+        aligned_ids[start:end].clone(),
+        mask_positions[start:end].clone(),
+    )
 
 
 def _weighted_choice(weights: dict[str, float], rng: random.Random, default: str) -> str:

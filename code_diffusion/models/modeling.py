@@ -145,6 +145,7 @@ def load_diffusion_model(config: dict) -> tuple[DiffusionCodeModel, object]:
     trust_remote_code = bool(config.get("trust_remote_code", False))
     adapter_config_path = Path(model_name) / "adapter_config.json"
     adapter_checkpoint = adapter_config_path.exists()
+    adapter_is_trainable = bool(config.get("load_adapter_trainable", False) or config.get("resume_checkpoint_dir"))
     quantized_loading = config.get("finetune_method") == "qlora" and resolved_device.startswith("cuda")
 
     base_model_name = model_name
@@ -169,7 +170,11 @@ def load_diffusion_model(config: dict) -> tuple[DiffusionCodeModel, object]:
             requested_value=config.get("bidirectional_attention_value"),
         )
 
-    torch_dtype = resolve_dtype(config.get("dtype", "float32"))
+    runtime_dtype_name = _resolve_runtime_dtype_name(
+        requested_dtype=str(config.get("dtype", "float32")),
+        device=resolved_device,
+    )
+    torch_dtype = resolve_dtype(runtime_dtype_name)
     from_pretrained_kwargs = {
         "config": model_config,
         "trust_remote_code": trust_remote_code,
@@ -186,9 +191,11 @@ def load_diffusion_model(config: dict) -> tuple[DiffusionCodeModel, object]:
     model.config.use_cache = False
 
     if adapter_checkpoint:
+        if adapter_is_trainable:
+            model = _prepare_base_model_for_adapter_training(model, config)
         from peft import PeftModel
 
-        model = PeftModel.from_pretrained(model, model_name, is_trainable=False)
+        model = PeftModel.from_pretrained(model, model_name, is_trainable=adapter_is_trainable)
     else:
         model = _apply_finetuning_strategy(model, config)
 
@@ -205,6 +212,13 @@ def load_diffusion_model(config: dict) -> tuple[DiffusionCodeModel, object]:
 
     _log_trainable_parameter_summary(wrapper.model)
     return wrapper, tokenizer
+
+
+def _resolve_runtime_dtype_name(*, requested_dtype: str, device: str) -> str:
+    if device == "mps" and requested_dtype == "bfloat16":
+        print("mps runtime does not behave well with bfloat16 here; falling back to float16 for inference/load.")
+        return "float16"
+    return requested_dtype
 
 
 def _resolve_bidirectional_mode(model_config, requested_value):
@@ -238,9 +252,12 @@ def _apply_finetuning_strategy(model: nn.Module, config: dict) -> nn.Module:
     if finetune_method == "qlora":
         from peft import prepare_model_for_kbit_training
 
+        gradient_checkpointing = bool(config.get("gradient_checkpointing", True))
+        gradient_checkpointing_kwargs = {"use_reentrant": False} if gradient_checkpointing else None
         model = prepare_model_for_kbit_training(
             model,
-            use_gradient_checkpointing=bool(config.get("gradient_checkpointing", True)),
+            use_gradient_checkpointing=gradient_checkpointing,
+            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         )
     else:
         _maybe_enable_gradient_checkpointing(model, config)
@@ -255,6 +272,24 @@ def _apply_finetuning_strategy(model: nn.Module, config: dict) -> nn.Module:
         target_modules=config.get("lora_target_modules", "all-linear"),
     )
     model = get_peft_model(model, lora_config)
+    return model
+
+
+def _prepare_base_model_for_adapter_training(model: nn.Module, config: dict) -> nn.Module:
+    finetune_method = config.get("finetune_method", "full")
+    if finetune_method == "qlora":
+        from peft import prepare_model_for_kbit_training
+
+        gradient_checkpointing = bool(config.get("gradient_checkpointing", True))
+        gradient_checkpointing_kwargs = {"use_reentrant": False} if gradient_checkpointing else None
+        return prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=gradient_checkpointing,
+            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
+        )
+
+    if finetune_method == "lora":
+        _maybe_enable_gradient_checkpointing(model, config)
     return model
 
 

@@ -10,12 +10,18 @@ import torch
 from torch.utils.data import Dataset
 
 from code_diffusion.config import DEFAULT_CONFIG
-from code_diffusion.data.example_builder import SampleBlueprint, build_training_example, choose_blueprint
+from code_diffusion.data.example_builder import (
+    SampleBlueprint,
+    build_prepared_training_example,
+    build_training_example,
+    choose_blueprint,
+)
 from code_diffusion.data.quality import (
     FileQualityReport,
     assess_file_quality,
     build_chunk_quality_metadata,
     export_quality_reports,
+    hash_normalized_code,
 )
 from code_diffusion.data.synthetic import SyntheticExampleGenerator
 from code_diffusion.utils.tokenization import list_code_files, resolve_mask_token_id
@@ -64,6 +70,8 @@ class CodeDiffusionDataset(Dataset):
 
         self.num_source_files = 0
         self.num_accepted_source_files = 0
+        self.num_prepared_records = 0
+        self.source_dataset_counts: Counter[str] = Counter()
         self.file_quality_reports: list[FileQualityReport] = []
         self.rejection_stats: Counter[str] = Counter()
         self.task_type_counts: Counter[str] = Counter()
@@ -71,15 +79,51 @@ class CodeDiffusionDataset(Dataset):
         self.mask_strategy_counts: Counter[str] = Counter()
         self.samples = self._build_samples()
         self.access_counts = [0 for _ in self.samples]
+        self.sample_task_buckets = [self._resolve_task_bucket(sample) for sample in self.samples]
+        self.current_task_type_weights = _normalize_weight_mapping(self.config.get("task_type_weights", {}))
 
     def set_mask_ratio(self, mask_ratio: float) -> None:
         self.current_mask_ratio = max(self.mask_ratio_min, min(self.mask_ratio_max, mask_ratio))
+
+    def get_task_type_weights(self) -> dict[str, float]:
+        return deepcopy(self.current_task_type_weights)
+
+    def set_task_type_weights(self, task_type_weights: dict[str, float]) -> dict[str, float]:
+        normalized = _normalize_weight_mapping(task_type_weights)
+        self.current_task_type_weights = normalized
+        self.config["task_type_weights"] = deepcopy(normalized)
+        return deepcopy(normalized)
+
+    def get_weighted_sample_weights(
+        self,
+        task_type_weights: dict[str, float] | None = None,
+    ) -> torch.DoubleTensor:
+        normalized = _normalize_weight_mapping(task_type_weights or self.current_task_type_weights)
+        if not normalized:
+            return torch.ones(len(self.samples), dtype=torch.double)
+
+        bucket_counts = Counter(self.sample_task_buckets)
+        fallback_weight = 1.0 / max(len(normalized), 1)
+        weights = []
+        for bucket in self.sample_task_buckets:
+            bucket_weight = float(normalized.get(bucket, fallback_weight))
+            count = max(bucket_counts.get(bucket, 0), 1)
+            weights.append(bucket_weight / count)
+        return torch.tensor(weights, dtype=torch.double)
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str | dict[str, object]]:
         return self._materialize_sample(index=index, deterministic=False)
+
+    def get_example(
+        self,
+        index: int,
+        *,
+        deterministic: bool = True,
+    ) -> dict[str, torch.Tensor | str | dict[str, object]]:
+        return self._materialize_sample(index=index, deterministic=deterministic)
 
     def export_summary(self, output_dir: str | Path) -> dict[str, object]:
         output_path = Path(output_dir)
@@ -106,6 +150,8 @@ class CodeDiffusionDataset(Dataset):
             "total_samples": len(self.samples),
             "source_files_total": self.num_source_files,
             "source_files_accepted": self.num_accepted_source_files,
+            "prepared_records": self.num_prepared_records,
+            "source_dataset_distribution": dict(self.source_dataset_counts),
             "task_type_distribution": dict(self.task_type_counts),
             "task_bucket_distribution": dict(self.task_bucket_counts),
             "mask_strategy_distribution": dict(self.mask_strategy_counts),
@@ -129,15 +175,22 @@ class CodeDiffusionDataset(Dataset):
         return summary
 
     def _build_samples(self) -> list[dict[str, object]]:
-        files = list_code_files(self.data_dir, self.extensions)
+        rng = random.Random(self.seed)
+        samples: list[dict[str, object]] = []
+        samples.extend(self._load_prepared_samples())
+        if self.max_samples is not None and len(samples) >= self.max_samples:
+            return samples[: self.max_samples]
+
+        files = _safe_list_code_files(self.data_dir, self.extensions)
         if self.max_files is not None:
             files = files[: self.max_files]
 
         self.num_source_files = len(files)
-        rng = random.Random(self.seed)
-        samples: list[dict[str, object]] = []
         seen_file_hashes: set[str] = set()
         seen_chunk_hashes: set[str] = set()
+        for sample in samples:
+            if sample.get("record_type") == "prepared":
+                seen_chunk_hashes.add(str(sample["dedupe_hash"]))
 
         for path in files:
             text = path.read_text(encoding="utf-8", errors="ignore")
@@ -200,6 +253,79 @@ class CodeDiffusionDataset(Dataset):
             raise ValueError(f"No tokenized samples found in {self.data_dir}")
         return samples
 
+    def _load_prepared_samples(self) -> list[dict[str, object]]:
+        prepared_paths = sorted(self.data_dir.rglob(self.config.get("prepared_examples_filename", "prepared_examples.jsonl")))
+        if not prepared_paths:
+            return []
+
+        samples: list[dict[str, object]] = []
+        seen_hashes: set[str] = set()
+        for path in prepared_paths:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                sample = self._build_prepared_sample_record(record)
+                if sample is None:
+                    continue
+                if self.config.get("deduplicate_dataset", True) and sample["dedupe_hash"] in seen_hashes:
+                    self.rejection_stats["duplicate_prepared_record"] += 1
+                    continue
+                seen_hashes.add(str(sample["dedupe_hash"]))
+                samples.append(sample)
+                self.num_prepared_records += 1
+                self.task_type_counts[str(sample["task_type"])] += 1
+                self.task_bucket_counts[str(sample["metadata"].get("task_bucket", sample["task_type"]))] += 1
+                self.mask_strategy_counts[str(sample["metadata"].get("mask_strategy", "prepared_pair"))] += 1
+                self.source_dataset_counts[str(sample["metadata"].get("source_dataset", "prepared"))] += 1
+                if self.max_samples is not None and len(samples) >= self.max_samples:
+                    return samples
+        return samples
+
+    def _build_prepared_sample_record(self, record: dict[str, object]) -> dict[str, object] | None:
+        target_code = record.get("target_code")
+        corrupted_code = record.get("corrupted_code")
+        task_type = str(record.get("task_type", "masked_reconstruction"))
+        metadata = dict(record.get("metadata") or {})
+        mask_metadata = dict(record.get("mask_metadata") or {})
+        if not isinstance(target_code, str) or not isinstance(corrupted_code, str):
+            self.rejection_stats["prepared_missing_text"] += 1
+            return None
+        if _is_low_signal_chunk(target_code):
+            self.rejection_stats["prepared_low_signal"] += 1
+            return None
+
+        dedupe_hash = hash_normalized_code(f"{task_type}\n{target_code}\n{corrupted_code}")
+        quality_score = float(metadata.get("quality_score", 0.9))
+        source_type = str(metadata.get("source_type", "implementation"))
+        source_path = str(metadata.get("source_path", metadata.get("source_id", "prepared")))
+        valid_length = len(self.tokenizer(target_code, add_special_tokens=False, truncation=False)["input_ids"])
+        if valid_length < 8:
+            self.rejection_stats["prepared_too_short"] += 1
+            return None
+
+        metadata.setdefault("mask_strategy", "prepared_pair")
+        metadata.setdefault("task_bucket", task_type)
+        metadata.setdefault("source_dataset", "prepared")
+        metadata.setdefault("synthetic", False)
+        metadata.setdefault("source_type", source_type)
+        metadata.setdefault("source_path", source_path)
+
+        return {
+            "record_type": "prepared",
+            "task_type": task_type,
+            "target_code": target_code,
+            "corrupted_code": corrupted_code,
+            "mask_metadata": mask_metadata,
+            "metadata": metadata,
+            "quality_score": quality_score,
+            "source_type": source_type,
+            "source_path": source_path,
+            "is_valid_target": metadata.get("target_is_valid"),
+            "valid_length": min(valid_length, self.seq_length),
+            "dedupe_hash": dedupe_hash,
+        }
+
     def _build_sample_record(
         self,
         *,
@@ -246,6 +372,19 @@ class CodeDiffusionDataset(Dataset):
         if not deterministic:
             self.access_counts[index] += 1
 
+        if sample.get("record_type") == "prepared":
+            return build_prepared_training_example(
+                tokenizer=self.tokenizer,
+                task_type=str(sample["task_type"]),
+                target_code=str(sample["target_code"]),
+                corrupted_code=str(sample["corrupted_code"]),
+                metadata=dict(sample["metadata"]),
+                mask_metadata=dict(sample["mask_metadata"]),
+                seq_length=self.seq_length,
+                pad_token_id=self.pad_token_id,
+                mask_token_id=self.mask_token_id,
+            )
+
         return build_training_example(
             tokenizer=self.tokenizer,
             clean_ids=sample["target_ids"],
@@ -265,6 +404,17 @@ class CodeDiffusionDataset(Dataset):
             torch_seed=torch_seed,
             is_valid_target=sample["is_valid_target"],
         )
+
+    def _resolve_task_bucket(self, sample: dict[str, object]) -> str:
+        if sample.get("record_type") == "prepared":
+            metadata = sample.get("metadata")
+            if isinstance(metadata, dict):
+                return str(metadata.get("task_bucket", sample.get("task_type", "masked_reconstruction")))
+            return str(sample.get("task_type", "masked_reconstruction"))
+        blueprint = sample.get("blueprint")
+        if blueprint is not None and hasattr(blueprint, "task_bucket"):
+            return str(blueprint.task_bucket)
+        return "masked_reconstruction"
 
     def _tokenize_with_offsets(
         self,
@@ -312,6 +462,13 @@ def _build_dataset_config(
     merged["mask_ratio_min"] = float(mask_ratio_min)
     merged["mask_ratio_max"] = float(mask_ratio_max)
     return merged
+
+
+def _safe_list_code_files(data_dir: Path, extensions: list[str]) -> list[Path]:
+    try:
+        return list_code_files(data_dir, extensions)
+    except FileNotFoundError:
+        return []
 
 
 def _extract_chunk_text(
@@ -380,3 +537,15 @@ def _render_summary_markdown(summary: dict[str, object]) -> str:
     else:
         lines.append("- none")
     return "\n".join(lines) + "\n"
+
+
+def _normalize_weight_mapping(weights: dict[str, object] | None) -> dict[str, float]:
+    if not weights:
+        return {}
+
+    normalized = {str(key): max(float(value), 0.0) for key, value in weights.items()}
+    total = sum(normalized.values())
+    if total <= 0:
+        uniform = 1.0 / max(len(normalized), 1)
+        return {key: uniform for key in normalized}
+    return {key: value / total for key, value in normalized.items()}

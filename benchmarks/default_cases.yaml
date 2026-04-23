@@ -1,0 +1,135 @@
+- id: py-add-return
+  language: python
+  task_type: masked_reconstruction
+  prompt: |
+    def add(a, b):
+        [MASK:8]
+  target: |
+    def add(a, b):
+        return a + b
+
+- id: py-divide-guard
+  language: python
+  task_type: span_completion
+  prompt: |
+    def divide(a, b):
+        if b == 0:
+            [MASK:12]
+        return a / b
+  target: |
+    def divide(a, b):
+        if b == 0:
+            raise ValueError("division by zero")
+        return a / b
+
+- id: py-factorial-loop
+  language: python
+  task_type: draft_refinement
+  prompt: |
+    def factorial(n):
+        total = 1
+        [MASK:20]
+        return total
+  target: |
+    def factorial(n):
+        total = 1
+        for value in range(2, n + 1):
+            total *= value
+        return total
+
+- id: py-bugfix-even
+  language: python
+  task_type: bug_fix
+  prompt: |
+    def is_even(n):
+        return n % 2 [MASK:4] 0
+  target: |
+    def is_even(n):
+        return n % 2 == 0
+
+- id: py-context-divide
+  language: python
+  task_type: bug_fix
+  prompt: |
+    # repo: demo/math-utils
+    # path: math_utils.py
+    # change_request: raise a clear error when b is zero before dividing
+    def divide(a, b):
+        [MASK:18]
+  target: |
+    # repo: demo/math-utils
+    # path: math_utils.py
+    # change_request: raise a clear error when b is zero before dividing
+    def divide(a, b):
+        if b == 0:
+            raise ValueError("division by zero")
+        return a / b
+
+- id: ts-clamp-min
+  language: typescript
+  task_type: masked_reconstruction
+  prompt: |
+    export function clamp(value: number, min: number, max: number): number {
+      if (value < min) {
+        [MASK:8]
+      }
+      if (value > max) {
+        return max;
+      }
+      return value;
+    }
+  target: |
+    export function clamp(value: number, min: number, max: number): number {
+      if (value < min) {
+        return min;
+      }
+      if (value > max) {
+        return max;
+      }
+      return value;
+    }
+
+- id: ts-sum-loop
+  language: typescript
+  task_type: span_completion
+  prompt: |
+    export function sum(items: number[]): number {
+      let total = 0;
+      [MASK:18]
+      return total;
+    }
+  target: |
+    export function sum(items: number[]): number {
+      let total = 0;
+      for (const item of items) {
+        total += item;
+      }
+      return total;
+    }
+
+- id: ts-context-runner-fix
+  language: typescript
+  task_type: bug_fix
+  prompt: |
+    // repo: elastic/synthetics
+    // path: src/core/runner.ts
+    // issue: propagate errors from beforeAll and afterAll hooks to the reported run state
+    export default class Runner extends EventEmitter {
+      async runJourney() {
+        [MASK:24]
+      }
+    }
+  target: |
+    // repo: elastic/synthetics
+    // path: src/core/runner.ts
+    // issue: propagate errors from beforeAll and afterAll hooks to the reported run state
+    export default class Runner extends EventEmitter {
+      async runJourney() {
+        try {
+          await this.beforeAll();
+        } catch (error) {
+          this.reporter.onError(error);
+          throw error;
+        }
+      }
+    }

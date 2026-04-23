@@ -19,6 +19,20 @@ task_type_weights:
   refinement: 0.15
   doc_test_based: 0.1
 
+benchmark_controller_enabled: true
+benchmark_controller_score_weights:
+  exact_match: 0.7
+  similarity: 0.3
+benchmark_controller_best_dirname: best
+benchmark_controller_improvement_threshold: 0.0001
+benchmark_controller_plateau_patience: 2
+benchmark_controller_lr_decay_factor: 0.5
+benchmark_controller_min_learning_rate: 0.00001
+benchmark_controller_reweight_task_mix: true
+benchmark_controller_task_mix_strength: 1.0
+benchmark_controller_task_mix_momentum: 0.5
+benchmark_controller_min_task_weight: 0.05
+
 mask_strategy_weights:
   random: 0.3
   span: 0.25
@@ -47,6 +61,28 @@ max_file_size_bytes: 200000
 max_line_length: 400
 max_code_lines: 2000
 dataset_preview_examples: 5
+prepared_examples_filename: prepared_examples.jsonl
+prepare_output_dir: ./outputs/prepared_corpus/public_mix_v1
+prepare_include_local_data: true
+prepare_include_codesearchnet: true
+prepare_include_commitpackft: true
+prepare_include_swe_rebench: true
+prepare_languages:
+  - python
+  - javascript
+  - typescript
+  - go
+  - rust
+prepare_codesearchnet_examples_per_language: 200
+prepare_commitpack_examples_per_language: 200
+prepare_swe_rebench_examples_per_language: 75
+prepare_max_local_files: 200
+prepare_context_lines: 24
+prepare_max_example_chars: 12000
+prepare_include_commit_context: true
+prepare_include_issue_context: true
+prepare_include_repo_context: true
+prepare_context_max_lines: 8
 
 synthetic_generation_enabled: false
 synthetic_provider:
